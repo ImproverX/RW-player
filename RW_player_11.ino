@@ -1,5 +1,5 @@
-#define vers "version 11.8"
-/* Оптимизация в IDE 1.8.7+ *
+#define vers "version 11.9"
+/* Оптимизация в IDE 1.8.19+ с новыми библиотеками *
 
   Вариант на "Data Logger Shield" и "LCD Keypad Shield"
   (на первом есть RTC -- используем для показа времени)
@@ -29,34 +29,62 @@
    LCD R/W pin    - GND
    LCD 5V pin     - 5V
 
+   Подсветка      - D10
+
    Кнопки         - A0
 
    Дополнительно к стандартным требуются библиотеки:
    - RTClib (от Adafruit, библиотека TinyWireM не обязательна)
    - SdFat (от Bill Greiman)
-   - TimerOne (от Jesse Tane...)
+   - TimerOne (от Paul Stoffregen //Jesse Tane...)
 */
 
 // Подгружаемые библиотеки:
 #include <LiquidCrystal.h>
 #include <SdFat.h>
+//#include <sdios.h>    //+++
 #include <TimerOne.h>
 //#include <Wire.h>    // уже включено в <RTClib.h>
 #include <RTClib.h>
+
+// SD_FAT_TYPE = 0 for SdFat/File as defined in SdFatConfig.h,
+// 1 for FAT16/FAT32, 2 for exFAT, 3 for FAT16/FAT32 and exFAT.
+#define SD_FAT_TYPE 1
+/*
+  Set DISABLE_CS_PIN to disable a second SPI device.
+  For example, with the Ethernet shield, set DISABLE_CS_PIN
+  to 10 to disable the Ethernet controller.
+*/
+//const int8_t DISABLE_CS_PIN = -1;
+const uint8_t SD_CS_PIN = 10;
+
+// Try max SPI clock for an SD. Reduce SPI_CLOCK if errors occur.
+#define SPI_CLOCK SD_SCK_MHZ(50)
+#define ENABLE_DEDICATED_SPI 0  // чтобы не гас экран при воспроизведении/записи
+
+// Try to select the best SD card configuration.
+#if HAS_SDIO_CLASS
+#define SD_CONFIG SdioConfig(FIFO_SDIO)
+#elif ENABLE_DEDICATED_SPI
+#define SD_CONFIG SdSpiConfig(SD_CS_PIN, DEDICATED_SPI, SPI_CLOCK)
+#else  // HAS_SDIO_CLASS
+#define SD_CONFIG SdSpiConfig(SD_CS_PIN, SHARED_SPI, SPI_CLOCK)
+#endif  // HAS_SDIO_CLASS
 
 //инициализация часов
 RTC_DS1307 RTC;
 // инициализация экрана
 LiquidCrystal lcd(8, 9, 4, 5, 6, 7);
 
-SdFat sd;
-SdFile dataFile;
+SdFat32 sd;
+File32 dataFile;
 
 char sfileName[13];            // короткое имя текущего файла/директории
-unsigned int currentFile = 1;  // текущая позиция в директории
-unsigned int maxFile = 0;      // всего позиций в директории (файлов и поддиректорий)
+uint16_t dirIndex;             // текущая позиция в директории
 boolean isDir = false;         // признак того, что текущая позиция -- это директория
 boolean isRoot = true;         // признак того, что мы в корне
+uint16_t pathIndex[10];        // таблица индексов пути
+int Num = 0;                   // номер в таблице индексов пути
 
 unsigned int Nbt;              // размер файла, байт
 unsigned int CSF;              // контрольная сумма
@@ -92,12 +120,12 @@ const byte BT_select = 5;
 byte MLevel = 0; // текущий пункт меню
 const byte M_play = 0;      // воспроизведение
 const byte M_play_in = 10;
-const byte M_dplay = 1;     // воспроизведение в формате DOS
-const byte M_dplay_in = 11;
-const byte M_record = 2;    // запись
-const byte M_record_in = 12;
-const byte M_setup = 3;     // настройки
-const byte M_setup_in = 13;
+//const byte M_dplay = 1;     // воспроизведение в формате DOS
+//const byte M_dplay_in = 11;
+const byte M_record = 1;    // запись
+const byte M_record_in = 11;
+const byte M_setup = 2;     // настройки
+const byte M_setup_in = 12;
 
 byte PlayROM(int pnt, byte BLs = 0x01); // функция вывода файла ROM, для значения по умолчанию "с первого блока"
 byte PlayAll(byte FType, byte StartAddrB = 0); // объявление функции вывода остальных типов файлов, для значения по умолчанию
@@ -119,7 +147,6 @@ void setup() {
 
   printtextF(F("BEKTOP-MF"), 0);        // вывод названия
   printtextF(F(vers), 1);               // и версии
-  delay(2000);                          // ждем 2с для солидности :-)
 
   //  Wire.begin();                         // уже включено в <RTClib.h>
   RTC.begin();                          // запуск часов
@@ -132,14 +159,17 @@ void setup() {
   }
   //RTC.adjust(DateTime(__DATE__, __TIME__)); //-- это если понадобится принудительно обновить время
 
-  while (!sd.begin(10, SPI_FULL_SPEED)) { // SD-карта готова?
+  while (!sd.begin(SD_CONFIG)) {        // SD-карта готова?
     printtextF(F("SD-card failed!"), 1);
     delay(3000);       // ждем 3 с
   }
   //printtextF(F("SD-card is OK."), 1);
+
   sd.chdir();            // устанавливаем корневую директорию SD
 
   DIDR1 = (1 << AIN1D) | (1 << AIN0D); // Выключить цифровые входы контактов Digital 6 и 7
+
+  delay(2000);                          // ждем 2с для солидности :-)
 }
 
 void loop() {
@@ -166,18 +196,19 @@ void loop() {
       }
       break;
     case BT_right:  // вправо -- вход в меню, запуск действия и т.д.
+    case BT_select: // select --//--
       if (MLevel < 10) {
         MLevel += 10;   // заходим в подменю
         switch (MLevel) // выводим надписи меню
         {
           case M_play_in:  // воспроизведение
-          case M_dplay_in: // воспроизведение (DOS)
+            //case M_dplay_in: // воспроизведение (DOS)
             printplay();   // вывод надписи "Play file..."
-            getMaxFile();
+            NextFile();
             break;
           case M_record_in: // запись
             printtextF(F("Record to file:"), 0);
-            sd.chdir();  // устанавливаем корневую директорию SD
+            sd.chdir();     // устанавливаем корневую директорию SD
             while (sd.exists(iFName)) { // ищем первый отсутствующий файл по имени, увеличивая счётчик
               if (iFName[7] < '9') { // увеличиваем единицы
                 iFName[7]++;
@@ -205,9 +236,9 @@ void loop() {
       break;
     case BT_left: // влево
       break;
-    case BT_select: // Возврат в корень меню
-      MLevel = 0;
-      break;
+    //case BT_select: // Возврат в корень меню
+    //  MLevel = 0;
+    //  break;
     case BT_none: // ничего не нажато
       delay(100);
       break;
@@ -219,10 +250,10 @@ void loop() {
       printtextF(F("Play file ->"), 0);
       printtime();
       break;
-    case M_dplay: // воспроизведение (DOS)
-      printtextF(F("Play to DOS ->"), 0);
-      printtime();
-      break;
+    //case M_dplay: // воспроизведение (DOS)
+    //  printtextF(F("Play to DOS ->"), 0);
+    //  printtime();
+    //  break;
     case M_record: // запись
       printtextF(F("Record data ->"), 0);
       printtime();
@@ -232,45 +263,38 @@ void loop() {
       printtime();
       break;
     case M_play_in: // зашли в меню вопроизведения
-    case M_dplay_in:
       switch (button)
       {
         case BT_up: // вверх по файлам
-          currentFile--;
-          if (currentFile < 1) {
-            currentFile = maxFile;
-          }
-          seekFile(); // показать имя текущего файла/директории
+          PrevFile();
           break;
         case BT_down: // вниз по файлам
-          currentFile++;
-          if (currentFile > maxFile) {
-            currentFile = 1;
-          }
-          seekFile(); // показать имя текущего файла/директории
+          NextFile();
           break;
         case BT_left: // в корень или выход
           if (isRoot) {
             MLevel = MLevel - 10; // из корня выходим в стартовое меню
           }
-          else {        // возврат в корневую директорию, ремарка ниже:
-            //SDFat has no easy way to move up a directory, so returning to root is the easiest way.
-            //each directory (except the root) must have a file called ROOT (no extension)
-            sd.chdir(true);
-            isRoot = true; // помечаем, что мы в корне
-            getMaxFile();
+          else {        // возврат в корневую директорию
+            cdUp();
+            NextFile();
+            PrevFile(); // возврат на первый файл
           }
           break;
+        case BT_select: // вход в директорию, или запуск файла на воспроизведение (DOS)
         case BT_right: // вход в директорию, или запуск файла на воспроизведение
           if (isDir) { //Если это директория, то переход в неё
-            sd.chdir(sfileName, true);
-            isRoot = false;
-            getMaxFile();
+            sd.chdir(sfileName); //sd.chdir(sfileName, true);
+            if (Num < 9) {
+              pathIndex[Num] = dirIndex;
+              Num++;
+            }
+            NextFile();
           }
           else {         // если не директория -- пробуем воспроизвести файл
             if (Nbt != 0xFFFF) { // проверяем размер файла
               RCrom = 11; // для вывода сообщения "неверный формат"
-              printtextF(F("Playing..."), 0);
+              //printtextF(F("Playing..."), 0);
 
               byte PNT = 0;
               for (byte i = 0; i <= 12; i++) { // Переводим все буквы имени файла в заглавные
@@ -281,7 +305,8 @@ void loop() {
                 }
               }
 
-              if (MLevel == M_dplay_in) {   // если вывод в формате DOS
+              if (button == BT_select) {   // если вывод в формате DOS
+                printtextF(F("[DOS] >>>"), 0);
                 RCrom = PlayAll(4);         // вызов ПП для формата DOS
               }
               else {                                // другие форматы
@@ -292,6 +317,7 @@ void loop() {
                 {
                   case 'C': // первый символ == 'c'|'C'
                     if ( (sfileName[PNT + 2] == 'A') & (sfileName[PNT + 3] == 'S') ) { // второй символ == 'a'|'A' и третий == 's'|'S'
+                      printtextF(F("[CAS] >>>"), 0);
                       RCrom = PlayAll(0);           // вызов ПП для формата CAS
                       break;
                     } // если не CAS, то далее проверяем на COM/C0M
@@ -305,16 +331,19 @@ void loop() {
                       }
                     }
                     if (StartAddr < 0x100) { // если стартовый адрес из расширения определён верно
+                      printtextF(F("[ROM] >>>"), 0);
                       RCrom = PlayROM(PNT, lowByte(StartAddr)); // вызов ПП для формата ROM с нужного блока
                     }
                     break;
                   case 'V': // первый символ == 'v'|'V'
                     if ( (sfileName[PNT + 2] == 'K') & (sfileName[PNT + 3] == 'T') ) { // второй символ == 'k'|'K' и третий == 't'|'T'
+                      printtextF(F("[VKT] >>>"), 0);
                       RCrom = PlayVKT(); // вызов ПП для формата VKT
                     }
                     break;
                   case 'B': // первый символ == 'b'|'B'
                     if ( (sfileName[PNT + 2] == 'A') & (sfileName[PNT + 3] == 'S') ) { // второй символ == 'a'|'A' и третий == 's'|'S'
+                      printtextF(F("[BAS] >>>"), 0);
                       RCrom = PlayAll(1);    // вызов ПП для формата BAS(C)
                       break; // выход из case, если это был BAS-файл
                     }
@@ -323,11 +352,13 @@ void loop() {
                       StartAddr = 0x01; // для расширения MON ставим адрес начала 0x0100
                     }
                     if (StartAddr < 0x100) { // если стартовый адрес из расширения определён верно
+                      printtextF(F("[MON] >>>"), 0);
                       RCrom = PlayAll(2, lowByte(StartAddr)); // вызов ПП для формата MON или Бейсика BLOAD
                     }
                     break;
                   case 'A': // первый символ == 'a'|'A'
                     if ( (sfileName[PNT + 2] == 'S') & (sfileName[PNT + 3] == 'M') ) { // второй символ == 's'|'S' и третий == 'm'|'M'
+                      printtextF(F("[ASM] >>>"), 0);
                       RCrom = PlayAll(3);    // вызов ПП для формата ASM
                     }
                     break;
@@ -335,7 +366,12 @@ void loop() {
               }
             }
             else {
-              RCrom = 10; // для вывода сообщения "большой файл"
+              if (dirIndex == 0) {
+                RCrom = 13; // просто ошибка
+              }
+              else {
+                RCrom = 10; // для вывода сообщения "большой файл"
+              }
             }
 
             digitalWrite(p, LOW);             // выход = 0
@@ -364,7 +400,8 @@ void loop() {
             }
             delay(1000);   // ждем 1 с
             printplay();   // вывод надписи "Play file..."
-            seekFile();    // показать имя текущего файла
+            dataFile.open(sfileName, O_READ);
+            printFileName();    // показать имя текущего файла
           }
       }
       break;
@@ -495,6 +532,8 @@ void loop() {
           if (Tpp > 160) Tpp = Tpp - 8; // уменьшаем скорость
           break;
         case BT_left: // влево
+        case BT_right:
+        case BT_select:
           MLevel = M_setup; // выход в коневое меню на пункт "настройки"
       }
       lcd.setCursor(12, 1);
@@ -519,9 +558,9 @@ byte getPressedButton()  // функция проверки нажатой кн�
   int buttonValue = analogRead(0);
   //Serial.println(buttonValue);
   if (buttonValue < 60) return BT_right;
-  else if (buttonValue < 180) return BT_up;
-  else if (buttonValue < 330) return BT_down;
-  else if (buttonValue < 530) return BT_left;
+  else if (buttonValue < 200) return BT_up;
+  else if (buttonValue < 400) return BT_down;
+  else if (buttonValue < 600) return BT_left;
   else if (buttonValue < 800) return BT_select;
   return BT_none;
 }
@@ -538,7 +577,7 @@ void printtextF(__FlashStringHelper* text, byte l) {  // Вывод текста
 void printtime() { // вывод времени и даты
   lcd.setCursor(0, 1); // устанавливаем курсор в позицию 0 в строке 1
   if (DT_good) {                              // если часы работают
-    char DT[15]; // = "00:00:00 00/00";
+    char DT[17];// = "00:00:00   00/00";
     DateTime now = RTC.now();                 // получаем и выводим текущее время и дату
     //sprintf(DT, "%02d:%02d:02d %-2d/%02d", now.hour(), now.minute(), now.second(), now.day(), now.month());
     DT[0] = now.hour() / 10 + '0';            // перевод из целого в символ
@@ -550,77 +589,167 @@ void printtime() { // вывод времени и даты
     DT[6] = now.second() / 10 + '0';          // секунды
     DT[7] = now.second() % 10 + '0';          // секунды
     DT[8] = ' ';
-    DT[9] = now.day() / 10 + '0';             // день
-    DT[10] = now.day() % 10 + '0';            // день
-    DT[11] = '/';
-    DT[12] = now.month() / 10 + '0';          // месяц
-    DT[13] = now.month() % 10 + '0';          // месяц
-    DT[14] = 0x00;
-    clrstr(lcd.print(DT));                    // выводим время и дату и очистка строки после текста
+    DT[9] = ' ';
+    DT[10] = ' ';
+    DT[11] = now.day() / 10 + '0';            // день
+    DT[12] = now.day() % 10 + '0';            // день
+    DT[13] = '/';
+    DT[14] = now.month() / 10 + '0';          // месяц
+    DT[15] = now.month() % 10 + '0';          // месяц
+    DT[16] = 0x00;
+    lcd.print(DT);                    // выводим время и дату
   }
   else {
-    clrstr(lcd.print(millis() / 1000));       // выводим количество секунд с момента влючения ардуины вместо времени
+    clrstr(lcd.print(millis() / 1000));       // выводим количество секунд с момента влючения ардуины вместо времени и очистка строки после текста
   }
 }
 
 void printplay() {
   lcd.setCursor(0, 0);
-  lcd.print(F("Play file"));
-  if (MLevel == M_dplay_in) {        // если вывод в формате DOS
-    lcd.print(F(" (DOS)"));
-  }
-  clrstr(lcd.print(':'));            // вывод двоеточия с очисткой строки после текста
+  clrstr(lcd.print(F("Play file:"))); // вывод с очисткой строки после текста
 }
 
-void getMaxFile() { // считаем файлы и директории в текущей директории и сохраняем в maxFile
-  dataFile.cwd()->rewind();
-  maxFile = 0;
-  while (dataFile.openNext(dataFile.cwd(), O_READ)) {
-    dataFile.close();
-    maxFile++;
-  }
-  currentFile = 1; // устанавливаем позицию на первый файл
-  seekFile();      // и переходим туда
-}
+void printFileName() {
+  if (dirIndex != 0) {
+    if (!dataFile.isOpen()) {
+      dataFile.open(sfileName, O_READ);
+    }
+    dataFile.getSFN(sfileName, 13);    // сохраняем короткое имя файла
+    isDir = dataFile.isDir();          // признак директории
+    if (dataFile.fileSize() <= 0xFFFE) { // проверка размера файла <=65534 или для VKT без служебной информации будет <=44458
+      Nbt = dataFile.fileSize();       // размер файла ОК
+    }
+    else {
+      Nbt = 0xFFFF;                    // слишком большой для загрузки
+    }
+    dataFile.close();                  // закрываем файл
 
-void seekFile() { // переход на позицию в директории, сохранение имени файла и показ его на экране
-  dataFile.cwd()->rewind();
-  for (int X = 1; X < currentFile; X++) { // читаем первые файлы до currentFile
-    dataFile.openNext(dataFile.cwd(), O_READ);
-    dataFile.close();
-  }
-  dataFile.openNext(dataFile.cwd(), O_READ); // читаем данные текущего файла
-  dataFile.getSFN(sfileName);       // сохраняем короткое имя файла
-  isDir = dataFile.isDir();         // признак директории
-  if (dataFile.fileSize() <= 0xFFFE) { // проверка размера файла <=65534 или для VKT без служебной информации будет <=44458
-    Nbt = dataFile.fileSize();      // размер файла ОК
-  }
-  else {
-    Nbt = 0xFFFF;                   // слишком большой для загрузки
-  }
-  dataFile.close();                 // закрываем файл
-
-  lcd.setCursor(0, 1);
-  lcd.print(sfileName);
-  if (isDir) {
-    clrstr(lcd.print('>'));         // если это директория, добавляем в конце символ '>' и очищаем строку
-  } else {                          // это не директория
-    clrstr(lcd.print(' '));         // очистка строки после текста
-    if (Nbt < 0xFFFF) {             // если размер файла в допустимых пределах
-      //lcd.setCursor(16, 1);
-      if (Nbt >= 1000) {            // если размер больше 999 байт
-        //WRB = lcd.print(Nbt / 1024);// подсчёт числа символов
-        lcd.setCursor(15 - lcd.print(Nbt / 1024), 1);
-        lcd.print(Nbt / 1024);      // вывод размера файла в кБ
-        lcd.print('k');
-      }
-      else {
-        //WRB = lcd.print(Nbt);       // подсчёт числа символов
-        lcd.setCursor(16 - lcd.print(Nbt), 1);
-        lcd.print(Nbt);             // вывод размера файла в байтах
+    lcd.setCursor(0, 1);
+    lcd.print(sfileName);
+    if (isDir) {
+      clrstr(lcd.print('>'));         // если это директория, добавляем в конце символ '>' и очищаем строку
+    } else {                          // это не директория
+      clrstr(lcd.print(' '));         // очистка строки после текста
+      if (Nbt < 0xFFFF) {             // если размер файла в допустимых пределах
+        //lcd.setCursor(16, 1);
+        if (Nbt >= 1000) {            // если размер больше 999 байт
+          //WRB = lcd.print(Nbt / 1024);// подсчёт числа символов
+          lcd.setCursor(15 - lcd.print(Nbt / 1024), 1);
+          lcd.print(Nbt / 1024);      // вывод размера файла в кБ
+          lcd.print('k');
+        }
+        else {
+          //WRB = lcd.print(Nbt);       // подсчёт числа символов
+          lcd.setCursor(16 - lcd.print(Nbt), 1);
+          lcd.print(Nbt);             // вывод размера файла в байтах
+        }
       }
     }
   }
+}
+
+void NextFile() { // переход к следующему файлу
+  File32 dir;
+  dir.openCwd();
+  isRoot = dir.isRoot();
+
+  if (dirIndex != 0) {
+    dataFile.open(&dir, dirIndex, O_RDONLY);  // читаем данные текущего файла
+    dataFile.close();
+  }
+
+  boolean OpenOk = false;
+  boolean LoopFiles = false;
+  do {
+    if (dataFile.openNext(&dir, O_RDONLY)) {  // читаем данные текущего файла
+      OpenOk = !dataFile.isHidden();
+      if (!OpenOk) {
+        dataFile.close();
+      }
+    }
+    else {
+      if (!LoopFiles) {
+        dir.rewindDirectory();// переход к первому файлу в директории
+        LoopFiles = true;
+      }
+      else {
+        dir.close();
+        NoFiles();
+        return;
+      }
+    }
+  }
+  while (!OpenOk);
+  dir.close();
+
+  dirIndex = dataFile.dirIndex();    // индекс в директории
+  printFileName();
+}
+
+void PrevFile() { // переход к предыдущему файлу
+  File32 dir;
+  dir.openCwd();
+  isRoot = dir.isRoot();
+
+  uint16_t maxIndex = 0;
+  uint16_t prevIndex = 0;
+  uint16_t curIndex = 0;
+
+  if (dirIndex != 0) {
+
+    dir.rewindDirectory();                       // переход к первому файлу в директории
+    while (dataFile.openNext(&dir, O_RDONLY)) {  // ищем максимальный и предыдущий индексы
+      if (!dataFile.isHidden()) {
+        curIndex = dataFile.dirIndex();
+        if (curIndex > maxIndex) {
+          maxIndex = curIndex;
+        }
+        if ((curIndex < dirIndex) & (curIndex > prevIndex)) {
+          prevIndex = curIndex;
+        }
+      }
+      dataFile.close();
+    }
+
+    if (prevIndex == 0) {
+      prevIndex = maxIndex;
+    }
+
+    if (prevIndex != 0) {
+      dataFile.open(&dir, prevIndex, O_RDONLY);  // читаем данные текущего файла
+      dir.close();
+      dirIndex = prevIndex;
+      printFileName();
+      return;
+    }
+  }
+  dir.close();
+  NoFiles();
+}
+
+void cdUp() { // переход на директорию выше
+  File32 dir;
+  sd.chdir();                         // выходим в корень
+
+  if (Num > 0) {
+    Num--;
+    for (int i = 0; i < Num; i++) {   // по индексам пройденных директорий читаем их имена и переходим по ним
+      dir.openCwd();
+      dataFile.open(&dir, pathIndex[i], O_RDONLY);
+      dataFile.getSFN(sfileName, 13);
+      dataFile.close();
+      dir.close();
+      sd.chdir(sfileName);
+    }
+  }
+}
+
+void NoFiles() {  // вывод надписи "нет файлов"
+  isDir = false;
+  dirIndex = 0;
+  lcd.setCursor(0, 1);
+  clrstr(lcd.print(F("- no files -"))); // с очисткой строки после текста
+  Nbt = 0xFFFF;                         // слишком большой для загрузки
 }
 
 void CalcTb()  // Вычисление значения задержки на начало байта Tb
@@ -948,14 +1077,14 @@ byte PlayROM(int pnt, byte BLs) // функция вывода файла ROM
       else SB[i + 14] = 0x20;            // дополняем пробелами
     }
 
-    dir_t d;
-    dataFile.dirEntry(&d);                    // Считываем дату файла и сохраняем в заголовке
-    SB[8] = FAT_DAY(d.lastWriteDate) / 10 + '0';           // перевод из целого в символ -- день
-    SB[9] = FAT_DAY(d.lastWriteDate) % 10 + '0';
-    SB[10] = FAT_MONTH(d.lastWriteDate) / 10 + '0';        // месяц
-    SB[11] = FAT_MONTH(d.lastWriteDate) % 10 + '0';
-    SB[12] = (FAT_YEAR(d.lastWriteDate) % 100) / 10 + '0'; // последние две цифры года
-    SB[13] = FAT_YEAR(d.lastWriteDate) % 10 + '0';
+    uint16_t d, t;
+    dataFile.getModifyDateTime(&d, &t);     // Считываем дату файла и сохраняем в заголовке
+    SB[8] = FS_DAY(d) / 10 + '0';           // перевод из целого в символ -- день
+    SB[9] = FS_DAY(d) % 10 + '0';
+    SB[10] = FS_MONTH(d) / 10 + '0';        // месяц
+    SB[11] = FS_MONTH(d) % 10 + '0';
+    SB[12] = (FS_YEAR(d) % 100) / 10 + '0'; // последние две цифры года
+    SB[13] = FS_YEAR(d) % 10 + '0';
 
     CRB = 0;                        // Сбрасываем индексы.
     CWB = 0;
@@ -1053,7 +1182,7 @@ void ToBUFF(byte SBb) {     // Подпрограмма записи байта 
   noInterrupts();               // запрет прерываний
   CRB_tmp = CRB;                // сохраняем CRB во временную переменную
   interrupts();                 // разрешение прерываний
-  if (CWB > (CRB_tmp + 255)) {  // Если позиция записи больше, чем позиция чтения + размер буфера - 1
+  if (CWB > (CRB_tmp + 250)) {  // Если позиция записи больше, чем позиция чтения + размер буфера - 6
     delay(Tpp);                 // Задержка (Tpp*1000 мкс = Tpp мс = 125 байт)
   }
   BUFF[lowByte(CWB)] = SBb;
