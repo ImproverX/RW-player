@@ -44,7 +44,7 @@ SD-картридер подключен к выводам ардуино:
 * Кнопки         - A0
 
 ## Пример сборки:
-![Player1](/Photo_1.jpg) ![Player3](/Photo_3.jpg)
+![Player1](/Photo_1.jpg)  ![Player3](/Photo_3.jpg)
 ![Player2](/Photo_2.jpg)
 
 [More info (russian)...](https://zx-pk.ru/threads/28819-rom-pleer-na-arduino.html?p=1073624&viewfull=1#post1073624)
